@@ -8,6 +8,7 @@ Colonnes Notion requises :
   Date de début (Date), Dernier visionnage (Date)
 """
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -29,6 +30,7 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28",
 }
+DEDUPE = os.environ.get("DEDUPE_ARCHIVE") == "1"  # 1 = mettre les doublons à la corbeille
 VALID_STATUS = {"CURRENT", "COMPLETED", "PAUSED", "DROPPED", "PLANNING", "REPEATING"}
 
 
@@ -53,11 +55,16 @@ def anilist(query, variables=None):
 
 
 def notion(method, path, **kwargs):
-    r = requests.request(
-        method, f"https://api.notion.com/v1{path}",
-        headers=NOTION_HEADERS, timeout=30, **kwargs,
-    )
-    time.sleep(0.35)
+    for _ in range(3):
+        r = requests.request(
+            method, f"https://api.notion.com/v1{path}",
+            headers=NOTION_HEADERS, timeout=30, **kwargs,
+        )
+        if r.status_code == 429:
+            time.sleep(int(r.headers.get("Retry-After", 5)))
+            continue
+        break
+    time.sleep(0.2)
     if not r.ok:
         raise RuntimeError(f"Notion {r.status_code}: {r.text}")
     return r.json()
@@ -172,50 +179,81 @@ def create_in_notion(entry):
 
 # ---------- Synchronisation ----------
 def main():
+    errors = 0
     al = fetch_anilist()
     by_title = {e["title"].lower(): e for e in al.values()}
-    pages = [parse_page(p) for p in fetch_notion_pages()]
-    print(f"AniList : {len(al)} animés | Notion : {len(pages)} lignes")
+    raw = fetch_notion_pages()
+    pages = [parse_page(p) for p in raw
+             if not (p.get("archived") or p.get("in_trash"))]
+    print(f"AniList : {len(al)} animés | Notion : {len(pages)} lignes actives")
 
     # 1. Lignes Notion sans AniList ID : on retrouve l'ID via le titre
     for p in pages:
         if p["al_id"] is not None or not p["title"]:
             continue
-        entry = by_title.get(p["title"].lower())
-        media_id = entry["id"] if entry else search_media(p["title"])
-        if not media_id:
-            print(f"  ! Introuvable sur AniList : {p['title']}")
-            continue
-        p["al_id"] = media_id
-        notion("PATCH", f"/pages/{p['page_id']}",
-               json={"properties": {"AniList ID": {"number": media_id}}})
-        print(f"  ID trouvé pour {p['title']} : {media_id}")
+        try:
+            entry = by_title.get(p["title"].lower())
+            media_id = entry["id"] if entry else search_media(p["title"])
+            if not media_id:
+                print(f"  ! Introuvable sur AniList : {p['title']}")
+                continue
+            notion("PATCH", f"/pages/{p['page_id']}",
+                   json={"properties": {"AniList ID": {"number": media_id}}})
+            p["al_id"] = media_id
+            print(f"  ID trouvé : {p['title']} -> {media_id}")
+        except Exception as e:
+            errors += 1
+            print(f"  ! Erreur sur « {p['title']} » : {e}")
 
-    # 2. Comparaison ligne par ligne
-    notion_ids = set()
+    # 2. Comparaison ligne par ligne (les doublons sont ignorés)
+    seen = set()
+    duplicates = 0
     for p in pages:
         mid = p["al_id"]
         if mid is None:
             continue
-        notion_ids.add(mid)
-        entry = al.get(mid)
-        if entry is None:
-            push_to_anilist(mid, p["status"], p["score"])
+        if mid in seen:
+            duplicates += 1
+            if DEDUPE:
+                try:
+                    notion("PATCH", f"/pages/{p['page_id']}", json={"archived": True})
+                except Exception as e:
+                    errors += 1
+                    print(f"  ! Doublon non supprimé : {e}")
             continue
-        if p["status"] == entry["status"] and p["score"] == entry["score"]:
-            continue
-        # Le plus récent gagne ; un statut Notion vide n'écrase jamais AniList
-        if not p["status"] or entry["updatedAt"] > p["edited"]:
-            pull_to_notion(p["page_id"], entry)
-        else:
-            push_to_anilist(mid, p["status"], p["score"])
+        seen.add(mid)
+        try:
+            entry = al.get(mid)
+            if entry is None:
+                push_to_anilist(mid, p["status"], p["score"])
+                continue
+            if p["status"] == entry["status"] and p["score"] == entry["score"]:
+                continue
+            # Le plus récent gagne ; un statut Notion vide n'écrase jamais AniList
+            if not p["status"] or entry["updatedAt"] > p["edited"]:
+                pull_to_notion(p["page_id"], entry)
+            else:
+                push_to_anilist(mid, p["status"], p["score"])
+        except Exception as e:
+            errors += 1
+            print(f"  ! Erreur sur « {p['title']} » : {e}")
+
+    if duplicates:
+        action = "mis à la corbeille" if DEDUPE else "ignorés (DEDUPE_ARCHIVE=1 pour les supprimer)"
+        print(f"{duplicates} doublons {action}")
 
     # 3. Animés présents sur AniList mais pas dans Notion
     for mid, entry in al.items():
-        if mid not in notion_ids:
-            create_in_notion(entry)
+        if mid not in seen:
+            try:
+                create_in_notion(entry)
+            except Exception as e:
+                errors += 1
+                print(f"  ! Création impossible « {entry['title']} » : {e}")
 
-    print("Synchronisation terminée.")
+    print(f"Synchronisation terminée ({errors} erreur(s)).")
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
