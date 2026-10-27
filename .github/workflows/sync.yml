@@ -1,0 +1,22 @@
+name: Sync AniList Notion
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python sync.py
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
+          ANILIST_TOKEN: ${{ secrets.ANILIST_TOKEN }}
+          ANILIST_USERNAME: ${{ secrets.ANILIST_USERNAME }}
