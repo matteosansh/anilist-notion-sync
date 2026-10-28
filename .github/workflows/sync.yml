@@ -1,18 +1,18 @@
 name: Sync AniList Notion
- 
+
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
- 
+
 concurrency:
   group: sync
   cancel-in-progress: false
- 
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,3 +26,5 @@ jobs:
           ANILIST_TOKEN: ${{ secrets.ANILIST_TOKEN }}
           ANILIST_USERNAME: ${{ secrets.ANILIST_USERNAME }}
           DEDUPE_ARCHIVE: ${{ vars.DEDUPE_ARCHIVE }}
+          LOOP_SECONDS: "60"
+          MAX_RUNTIME_SECONDS: "270"
