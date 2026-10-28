@@ -257,4 +257,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    interval = int(os.environ.get("LOOP_SECONDS", "0"))
+    max_runtime = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))  # 0 = sans limite
+    if interval:  # mode continu : relance la synchro toutes les N secondes
+        t0 = time.time()
+        while True:
+            try:
+                main()
+            except SystemExit:
+                pass
+            except Exception as e:
+                print(f"Erreur : {e}")
+            if max_runtime and time.time() - t0 + interval > max_runtime:
+                break
+            time.sleep(interval)
+    else:
+        main()
