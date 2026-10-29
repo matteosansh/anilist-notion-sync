@@ -36,6 +36,10 @@ VALID_STATUS = {"CURRENT", "COMPLETED", "PAUSED", "DROPPED", "PLANNING", "REPEAT
 
 
 # ---------- Helpers dates ----------
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def al_date_to_iso(d):
     """{'year','month','day'} AniList -> 'YYYY-MM-DD' ou None si incomplet."""
     if d and d.get("year") and d.get("month") and d.get("day"):
@@ -156,7 +160,7 @@ def parse_page(page):
     }
 
 
-# ---------- Écriture ----------
+# ---------- Recherche ----------
 def search_media(title):
     try:
         data = anilist(
@@ -167,6 +171,7 @@ def search_media(title):
         return None
 
 
+# ---------- Écriture ----------
 def push_to_anilist(media_id, p, entry=None):
     """Envoie l'état Notion vers AniList. Les champs vides de Notion
     (épisode, dates) reprennent la valeur AniList pour ne rien effacer."""
@@ -193,7 +198,7 @@ def push_to_anilist(media_id, p, entry=None):
     print(f"  -> AniList mis à jour (id {media_id})")
 
 
-def pull_to_notion(page_id, entry):
+def pull_to_notion(page_id, entry, progress_changed=False):
     props = {
         "Statut": {"select": {"name": entry["status"]}},
         "Score": {"number": entry["score"]},
@@ -203,6 +208,8 @@ def pull_to_notion(page_id, entry):
         props["Date de début"] = {"date": {"start": entry["started"]}}
     if entry["completed"]:
         props["Date de fin"] = {"date": {"start": entry["completed"]}}
+    if progress_changed:
+        props["Dernier visionnage"] = {"date": {"start": now_iso()}}
     notion("PATCH", f"/pages/{page_id}", json={"properties": props})
     print(f"  -> Notion mis à jour : {entry['title']}")
 
@@ -298,6 +305,9 @@ def main():
             entry = al.get(mid)
             if entry is None:
                 push_to_anilist(mid, p)
+                notion("PATCH", f"/pages/{p['page_id']}", json={"properties": {
+                    "Dernier visionnage": {"date": {"start": now_iso()}}
+                }})
                 continue
 
             if same(p, entry):
@@ -308,9 +318,15 @@ def main():
 
             # Le plus récent gagne ; un statut Notion vide n'écrase jamais AniList.
             if not p["status"] or entry["updatedAt"] > p["edited"]:
-                pull_to_notion(p["page_id"], entry)
+                progress_changed = p["progress"] != entry["progress"]
+                pull_to_notion(p["page_id"], entry, progress_changed=progress_changed)
             else:
                 push_to_anilist(mid, p, entry)
+                # Progression modifiée dans Notion : on horodate la dernière activité
+                if p["progress"] is not None and p["progress"] != entry["progress"]:
+                    notion("PATCH", f"/pages/{p['page_id']}", json={"properties": {
+                        "Dernier visionnage": {"date": {"start": now_iso()}}
+                    }})
         except Exception as e:
             errors += 1
             print(f"  ! Erreur sur « {p['title']} » : {e}")
