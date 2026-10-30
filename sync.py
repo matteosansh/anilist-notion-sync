@@ -1,13 +1,3 @@
-"""Synchronisation bidirectionnelle AniList <-> Notion.
-
-Variables d'environnement requises :
-  NOTION_TOKEN, DATABASE_ID, ANILIST_TOKEN, ANILIST_USERNAME
-
-Colonnes Notion requises :
-  Titre (Titre), Statut (Sélection), Score (Nombre), Épisode (Nombre),
-  AniList ID (Nombre), Date de début (Date), Date de fin (Date),
-  Dernier visionnage (Date)
-"""
 import os
 import sys
 import time
@@ -18,351 +8,266 @@ import requests
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DATABASE_ID = os.environ["DATABASE_ID"]
 ANILIST_TOKEN = os.environ["ANILIST_TOKEN"]
-ANILIST_USERNAME = os.environ["ANILIST_USERNAME"]
 
-ANILIST_URL = "https://graphql.anilist.co"
-AL_HEADERS = {
-    "Authorization": f"Bearer {ANILIST_TOKEN}",
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Content-Type": "application/json",
     "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json",
 }
-DEDUPE = os.environ.get("DEDUPE_ARCHIVE") == "1"  # 1 = mettre les doublons à la corbeille
-VALID_STATUS = {"CURRENT", "COMPLETED", "PAUSED", "DROPPED", "PLANNING", "REPEATING"}
+ANILIST_URL = "https://graphql.anilist.co"
+ANILIST_HEADERS = {
+    "Authorization": f"Bearer {ANILIST_TOKEN}",
+    "Content-Type": "application/json",
+}
 
+STATUTS = ["CURRENT", "COMPLETED", "PAUSED", "DROPPED", "PLANNING", "REPEATING"]
 
-# ---------- Helpers dates ----------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+# ---------------------------------------------------------------- AniList
 
-
-def al_date_to_iso(d):
-    """{'year','month','day'} AniList -> 'YYYY-MM-DD' ou None si incomplet."""
-    if d and d.get("year") and d.get("month") and d.get("day"):
-        return f"{d['year']}-{d['month']:02d}-{d['day']:02d}"
-    return None
-
-
-def iso_to_al_date(s):
-    """'YYYY-MM-DD...' -> dict pour AniList ; dict à None pour effacer la date."""
-    if not s:
-        return {"year": None, "month": None, "day": None}
-    y, m, d = s[:10].split("-")
-    return {"year": int(y), "month": int(m), "day": int(d)}
-
-
-# ---------- Helpers API ----------
 def anilist(query, variables=None):
-    for _ in range(3):
-        r = requests.post(
-            ANILIST_URL,
-            json={"query": query, "variables": variables or {}},
-            headers=AL_HEADERS,
-            timeout=30,
-        )
-        if r.status_code == 429:  # limite de requêtes
-            time.sleep(int(r.headers.get("Retry-After", 60)))
-            continue
-        break
+    r = requests.post(
+        ANILIST_URL,
+        json={"query": query, "variables": variables or {}},
+        headers=ANILIST_HEADERS,
+        timeout=30,
+    )
+    if r.status_code == 429:
+        time.sleep(int(r.headers.get("Retry-After", 60)))
+        return anilist(query, variables)
+    r.raise_for_status()
     data = r.json()
     if "errors" in data:
         raise RuntimeError(data["errors"])
-    time.sleep(0.7)
     return data["data"]
 
 
-def notion(method, path, **kwargs):
-    for _ in range(3):
-        r = requests.request(
-            method, f"https://api.notion.com/v1{path}",
-            headers=NOTION_HEADERS, timeout=30, **kwargs,
-        )
-        if r.status_code == 429:
-            time.sleep(int(r.headers.get("Retry-After", 5)))
-            continue
-        break
-    time.sleep(0.2)
-    if not r.ok:
-        raise RuntimeError(f"Notion {r.status_code}: {r.text}")
-    return r.json()
+def get_viewer_id():
+    return anilist("query { Viewer { id } }")["Viewer"]["id"]
 
 
-# ---------- Lecture ----------
-def fetch_anilist():
+def get_anilist_list(user_id):
     query = """
-    query ($userName: String) {
-      MediaListCollection(userName: $userName, type: ANIME) {
-        lists { entries {
-          mediaId status score progress updatedAt
-          startedAt { year month day }
-          completedAt { year month day }
-          media { title { romaji english } coverImage { extraLarge } }
-        } }
+    query ($userId: Int) {
+      MediaListCollection(userId: $userId, type: ANIME) {
+        lists {
+          entries {
+            mediaId
+            status
+            score(format: POINT_10)
+            progress
+            startedAt { year month day }
+            completedAt { year month day }
+            updatedAt
+            media {
+              title { romaji english }
+              nextAiringEpisode { airingAt episode }
+            }
+          }
+        }
       }
-    }"""
-    data = anilist(query, {"userName": ANILIST_USERNAME})
+    }
+    """
+    data = anilist(query, {"userId": user_id})
     entries = {}
     for lst in data["MediaListCollection"]["lists"]:
         for e in lst["entries"]:
-            t = e["media"]["title"]
-            entries[e["mediaId"]] = {
-                "id": e["mediaId"],
-                "title": t["romaji"] or t["english"] or "Sans titre",
-                "status": e["status"],
-                "score": e["score"] or 0,
-                "progress": e["progress"] or 0,
-                "updatedAt": e["updatedAt"] or 0,
-                "started": al_date_to_iso(e["startedAt"]),
-                "completed": al_date_to_iso(e["completedAt"]),
-                "image": e["media"]["coverImage"]["extraLarge"],
-            }
+            entries[e["mediaId"]] = e
     return entries
 
 
-def fetch_notion_pages():
+def save_anilist(media_id, status, score, progress, started, completed):
+    mutation = """
+    mutation ($mediaId: Int, $status: MediaListStatus, $score: Float,
+              $progress: Int, $started: FuzzyDateInput, $completed: FuzzyDateInput) {
+      SaveMediaListEntry(mediaId: $mediaId, status: $status, score: $score,
+                         progress: $progress, startedAt: $started, completedAt: $completed) {
+        id
+      }
+    }
+    """
+    anilist(mutation, {
+        "mediaId": media_id,
+        "status": status,
+        "score": score or 0,
+        "progress": progress or 0,
+        "started": started,
+        "completed": completed,
+    })
+
+
+# ------------------------------------------------------------------ Dates
+
+def fuzzy_to_iso(d):
+    if not d or not d.get("year"):
+        return None
+    return f"{d['year']:04d}-{d.get('month') or 1:02d}-{d.get('day') or 1:02d}"
+
+
+def iso_to_fuzzy(s):
+    if not s:
+        return {"year": None, "month": None, "day": None}
+    dt = datetime.fromisoformat(s[:10])
+    return {"year": dt.year, "month": dt.month, "day": dt.day}
+
+
+# ----------------------------------------------------------------- Notion
+
+def notion_query_all():
     pages, cursor = [], None
     while True:
         body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
-        res = notion("POST", f"/databases/{DATABASE_ID}/query", json=body)
-        pages.extend(res["results"])
-        if not res["has_more"]:
-            return pages
-        cursor = res["next_cursor"]
-
-
-def date_prop(props, name):
-    """Lit une colonne Date Notion -> 'YYYY-MM-DD' ou None."""
-    d = (props.get(name) or {}).get("date")
-    return d["start"][:10] if d and d.get("start") else None
-
-
-def parse_page(page):
-    props = page["properties"]
-    ep = props.get("Épisode", {}).get("number")
-    return {
-        "page_id": page["id"],
-        "title": "".join(t["plain_text"] for t in props["Titre"]["title"]).strip(),
-        "al_id": props["AniList ID"]["number"],
-        "status": (props["Statut"]["select"] or {}).get("name"),
-        "score": props["Score"]["number"] or 0,
-        "progress": int(ep) if ep is not None else None,  # None = colonne vide
-        "started": date_prop(props, "Date de début"),
-        "completed": date_prop(props, "Date de fin"),
-        "edited": datetime.fromisoformat(
-            page["last_edited_time"].replace("Z", "+00:00")
-        ).timestamp(),
-    }
-
-
-# ---------- Recherche ----------
-def search_media(title):
-    try:
-        data = anilist(
-            "query ($s: String) { Media(search: $s, type: ANIME) { id } }", {"s": title}
+        r = requests.post(
+            f"https://api.notion.com/v1/databases/{DATABASE_ID}/query",
+            headers=NOTION_HEADERS, json=body, timeout=30,
         )
-        return data["Media"]["id"]
-    except RuntimeError:
-        return None
+        r.raise_for_status()
+        data = r.json()
+        pages += data["results"]
+        if not data.get("has_more"):
+            break
+        cursor = data["next_cursor"]
+    return pages
 
 
-# ---------- Écriture ----------
-def push_to_anilist(media_id, p, entry=None):
-    """Envoie l'état Notion vers AniList. Les champs vides de Notion
-    (épisode, dates) reprennent la valeur AniList pour ne rien effacer."""
-    status = p["status"] if p["status"] in VALID_STATUS else "PLANNING"
-    progress = p["progress"] if p["progress"] is not None else (entry or {}).get("progress", 0)
-    started = p["started"] or (entry or {}).get("started")
-    completed = p["completed"] or (entry or {}).get("completed")
-    anilist(
-        """mutation ($id: Int, $status: MediaListStatus, $score: Float, $progress: Int,
-                     $startedAt: FuzzyDateInput, $completedAt: FuzzyDateInput) {
-             SaveMediaListEntry(mediaId: $id, status: $status, score: $score,
-                                progress: $progress, startedAt: $startedAt,
-                                completedAt: $completedAt) { id }
-           }""",
-        {
-            "id": media_id,
-            "status": status,
-            "score": float(p["score"] or 0),
-            "progress": int(progress or 0),
-            "startedAt": iso_to_al_date(started),
-            "completedAt": iso_to_al_date(completed),
-        },
+def notion_update(page_id, props):
+    r = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=NOTION_HEADERS, json={"properties": props}, timeout=30,
     )
-    print(f"  -> AniList mis à jour (id {media_id})")
+    r.raise_for_status()
 
 
-def pull_to_notion(page_id, entry, progress_changed=False):
-    props = {
-        "Statut": {"select": {"name": entry["status"]}},
-        "Score": {"number": entry["score"]},
-        "Épisode": {"number": entry["progress"]},
+def notion_create(props):
+    r = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=NOTION_HEADERS,
+        json={"parent": {"database_id": DATABASE_ID}, "properties": props},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def read_page(page):
+    p = page["properties"]
+
+    def num(name):
+        return (p.get(name) or {}).get("number")
+
+    def date(name):
+        d = (p.get(name) or {}).get("date")
+        return d["start"] if d else None
+
+    def select(name):
+        s = (p.get(name) or {}).get("select")
+        return s["name"] if s else None
+
+    title = "".join(t["plain_text"] for t in p["Titre"]["title"]) if "Titre" in p else ""
+    return {
+        "id": page["id"],
+        "title": title,
+        "anilist_id": num("AniList ID"),
+        "status": select("Statut"),
+        "score": num("Score"),
+        "episode": num("Épisode"),
+        "start": date("Date de début"),
+        "end": date("Date de fin"),
+        "last_watch": date("Dernier visionnage"),
+        "edited": datetime.fromisoformat(page["last_edited_time"].replace("Z", "+00:00")),
     }
-    if entry["started"]:
-        props["Date de début"] = {"date": {"start": entry["started"]}}
-    if entry["completed"]:
-        props["Date de fin"] = {"date": {"start": entry["completed"]}}
-    if progress_changed:
-        props["Dernier visionnage"] = {"date": {"start": now_iso()}}
-    notion("PATCH", f"/pages/{page_id}", json={"properties": props})
-    print(f"  -> Notion mis à jour : {entry['title']}")
 
 
-def create_in_notion(entry):
-    props = {
-        "Titre": {"title": [{"text": {"content": entry["title"]}}]},
-        "Score": {"number": entry["score"]},
-        "Épisode": {"number": entry["progress"]},
-        "Statut": {"select": {"name": entry["status"]}},
-        "AniList ID": {"number": entry["id"]},
-        "Dernier visionnage": {"date": {"start": datetime.fromtimestamp(
-            entry["updatedAt"], tz=timezone.utc).isoformat()}},
+def airing_props(media):
+    nxt = (media or {}).get("nextAiringEpisode")
+    if not nxt:
+        return {
+            "Prochaine sortie": {"date": None},
+            "Temps restant": {"rich_text": []},
+        }
+    ts = nxt["airingAt"]
+    secs = max(0, ts - int(time.time()))
+    d, h, m = secs // 86400, (secs % 86400) // 3600, (secs % 3600) // 60
+    if d:
+        txt = f"Ép. {nxt['episode']} dans {d}j {h}h {m}min"
+    else:
+        txt = f"Ép. {nxt['episode']} dans {h}h {m}min"
+    iso = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    return {
+        "Prochaine sortie": {"date": {"start": iso}},
+        "Temps restant": {"rich_text": [{"text": {"content": txt}}]},
     }
-    if entry["started"]:
-        props["Date de début"] = {"date": {"start": entry["started"]}}
-    if entry["completed"]:
-        props["Date de fin"] = {"date": {"start": entry["completed"]}}
-    image = {"type": "external", "external": {"url": entry["image"]}}
-    notion("POST", "/pages", json={
-        "parent": {"database_id": DATABASE_ID},
-        "properties": props, "icon": image, "cover": image,
-    })
-    print(f"  -> Ajouté dans Notion : {entry['title']}")
 
 
-# ---------- Synchronisation ----------
-def same(p, entry):
-    """Vrai si Notion et AniList sont déjà alignés (champs vides Notion ignorés)."""
-    return (
-        p["status"] == entry["status"]
-        and p["score"] == entry["score"]
-        and (p["progress"] is None or p["progress"] == entry["progress"])
-        and (p["started"] is None or p["started"] == entry["started"])
-        and (p["completed"] is None or p["completed"] == entry["completed"])
-    )
+def props_from_anilist(e):
+    props = {
+        "Statut": {"select": {"name": e["status"]}},
+        "Score": {"number": e["score"] or None},
+        "Épisode": {"number": e["progress"]},
+        "Date de début": {"date": {"start": fuzzy_to_iso(e["startedAt"])} if fuzzy_to_iso(e["startedAt"]) else None},
+        "Date de fin": {"date": {"start": fuzzy_to_iso(e["completedAt"])} if fuzzy_to_iso(e["completedAt"]) else None},
+    }
+    if e.get("updatedAt"):
+        iso = datetime.fromtimestamp(e["updatedAt"], timezone.utc).isoformat()
+        props["Dernier visionnage"] = {"date": {"start": iso}}
+    props.update(airing_props(e.get("media")))
+    return props
 
 
-def has_gaps(p, entry):
-    """Vrai si Notion a des champs vides qu'AniList peut remplir."""
-    return (
-        (p["progress"] is None)
-        or (p["started"] is None and entry["started"])
-        or (p["completed"] is None and entry["completed"])
-    )
-
+# ------------------------------------------------------------------- Main
 
 def main():
+    user_id = get_viewer_id()
+    al = get_anilist_list(user_id)
+    pages = [read_page(p) for p in notion_query_all()]
     errors = 0
-    al = fetch_anilist()
-    by_title = {e["title"].lower(): e for e in al.values()}
-    raw = fetch_notion_pages()
-    pages = [parse_page(p) for p in raw
-             if not (p.get("archived") or p.get("in_trash"))]
-    print(f"AniList : {len(al)} animés | Notion : {len(pages)} lignes actives")
-
-    # 1. Lignes Notion sans AniList ID : on retrouve l'ID via le titre
-    for p in pages:
-        if p["al_id"] is not None or not p["title"]:
-            continue
-        try:
-            entry = by_title.get(p["title"].lower())
-            media_id = entry["id"] if entry else search_media(p["title"])
-            if not media_id:
-                print(f"  ! Introuvable sur AniList : {p['title']}")
-                continue
-            notion("PATCH", f"/pages/{p['page_id']}",
-                   json={"properties": {"AniList ID": {"number": media_id}}})
-            p["al_id"] = media_id
-            print(f"  ID trouvé : {p['title']} -> {media_id}")
-        except Exception as e:
-            errors += 1
-            print(f"  ! Erreur sur « {p['title']} » : {e}")
-
-    # 2. Comparaison ligne par ligne (les doublons sont ignorés)
     seen = set()
-    duplicates = 0
-    for p in pages:
-        mid = p["al_id"]
-        if mid is None:
-            continue
-        if mid in seen:
-            duplicates += 1
-            if DEDUPE:
-                try:
-                    notion("PATCH", f"/pages/{p['page_id']}", json={"archived": True})
-                except Exception as e:
-                    errors += 1
-                    print(f"  ! Doublon non supprimé : {e}")
-            continue
-        seen.add(mid)
+
+    for pg in pages:
+        label = pg["title"] or pg["id"]
         try:
+            mid = int(pg["anilist_id"]) if pg["anilist_id"] else None
+            if not mid:
+                continue
+            seen.add(mid)
             entry = al.get(mid)
+
+            # Entrée absente d'AniList : on la crée depuis Notion
             if entry is None:
-                push_to_anilist(mid, p)
-                notion("PATCH", f"/pages/{p['page_id']}", json={"properties": {
-                    "Dernier visionnage": {"date": {"start": now_iso()}}
-                }})
+                if pg["status"] in STATUTS:
+                    save_anilist(
+                        mid, pg["status"], pg["score"], int(pg["episode"] or 0),
+                        iso_to_fuzzy(pg["start"]), iso_to_fuzzy(pg["end"]),
+                    )
                 continue
 
-            if same(p, entry):
-                # Alignés : on comble seulement les champs vides côté Notion
-                if has_gaps(p, entry):
-                    pull_to_notion(p["page_id"], entry)
-                continue
+            al_updated = datetime.fromtimestamp(entry["updatedAt"] or 0, timezone.utc)
+            notion_diff = (
+                pg["status"] != entry["status"]
+                or (pg["episode"] or 0) != (entry["progress"] or 0)
+                or (pg["score"] or 0) != (entry["score"] or 0)
+            )
 
-            # Le plus récent gagne ; un statut Notion vide n'écrase jamais AniList.
-            if not p["status"] or entry["updatedAt"] > p["edited"]:
-                progress_changed = p["progress"] != entry["progress"]
-                pull_to_notion(p["page_id"], entry, progress_changed=progress_changed)
-            else:
-                push_to_anilist(mid, p, entry)
-                # Progression modifiée dans Notion : on horodate la dernière activité
-                if p["progress"] is not None and p["progress"] != entry["progress"]:
-                    notion("PATCH", f"/pages/{p['page_id']}", json={"properties": {
-                        "Dernier visionnage": {"date": {"start": now_iso()}}
-                    }})
-        except Exception as e:
+            # Notion plus récent que AniList et différent : Notion -> AniList
+            if notion_diff and pg["edited"] > al_updated and pg["status"] in STATUTS:
+                save_anilist(
+                    mid, pg["status"], pg["score"], int(pg["episode"] or 0),
+                    iso_to_fuzzy(pg["start"]), iso_to_fuzzy(pg["end"]),
+                )
+                # Relire pour renvoyer les dates normalisées par AniList
+                entry = get_anilist_list(user_id).get(mid, entry)
+
+            # AniList -> Notion (toujours, pour rafraîchir aussi le temps restant)
+            notion_update(pg["id"], props_from_anilist(entry))
+            time.sleep(0.35)
+        except Exception as ex:
             errors += 1
-            print(f"  ! Erreur sur « {p['title']} » : {e}")
+            print(f"  ! Erreur sur « {label} » : {ex}")
 
-    if duplicates:
-        action = "mis à la corbeille" if DEDUPE else "ignorés (DEDUPE_ARCHIVE=1 pour les supprimer)"
-        print(f"{duplicates} doublons {action}")
-
-    # 3. Animés présents sur AniList mais pas dans Notion
-    for mid, entry in al.items():
-        if mid not in seen:
-            try:
-                create_in_notion(entry)
-            except Exception as e:
-                errors += 1
-                print(f"  ! Création impossible « {entry['title']} » : {e}")
-
-    print(f"Synchronisation terminée ({errors} erreur(s)).")
+    print(f"Synchronisation terminée ({errors} erreur(s))")
     if errors:
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    interval = int(os.environ.get("LOOP_SECONDS", "0"))
-    max_runtime = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))  # 0 = sans limite
-    if interval:  # mode continu : relance la synchro toutes les N secondes
-        t0 = time.time()
-        while True:
-            try:
-                main()
-            except SystemExit:
-                pass
-            except Exception as e:
-                print(f"Erreur : {e}")
-            if max_runtime and time.time() - t0 + interval > max_runtime:
-                break
-            time.sleep(interval)
-    else:
-        main()
+    main()
