@@ -8,6 +8,7 @@ import requests
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DATABASE_ID = os.environ["DATABASE_ID"]
 ANILIST_TOKEN = os.environ["ANILIST_TOKEN"]
+CALENDAR_DB_ID = os.environ["CALENDAR_DB_ID"]
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -167,6 +168,53 @@ def notion_create(props):
     )
 
 
+# --------------------------------------------------------------- Calendrier
+
+def calendar_existing_names():
+    names, cursor = set(), None
+    while True:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        r = request_with_retry(
+            "POST",
+            f"https://api.notion.com/v1/databases/{CALENDAR_DB_ID}/query",
+            headers=NOTION_HEADERS,
+            json=body,
+        )
+        data = r.json()
+        for p in data["results"]:
+            t = p["properties"].get("Nom", {}).get("title") or []
+            names.add("".join(x["plain_text"] for x in t))
+        if not data.get("has_more"):
+            return names
+        cursor = data["next_cursor"]
+
+
+def calendar_log(page_id, title, episode, when_iso, existing):
+    name = f"{title} – Ép. {episode}"
+    if name in existing:
+        return False
+    request_with_retry(
+        "POST",
+        "https://api.notion.com/v1/pages",
+        headers=NOTION_HEADERS,
+        json={
+            "parent": {"database_id": CALENDAR_DB_ID},
+            "properties": {
+                "Nom": {"title": [{"text": {"content": name}}]},
+                "Date": {"date": {"start": when_iso}},
+                "Animes trackers": {"relation": [{"id": page_id}]},
+            },
+        },
+    )
+    existing.add(name)
+    time.sleep(0.35)
+    return True
+
+
+# ------------------------------------------------------------ lecture / écriture
+
 def read_page(page):
     p = page["properties"]
 
@@ -263,7 +311,8 @@ def main():
     by_id = {p["anilist_id"]: p for p in pages if p["anilist_id"]}
     print(f"AniList : {len(al)} entrées | Notion : {len(pages)} lignes")
 
-    errors = updated = created = pushed = 0
+    existing = calendar_existing_names()
+    errors = updated = created = pushed = logged = 0
 
     for mid, entry in al.items():
         label = ((entry.get("media") or {}).get("title") or {}).get("romaji", mid)
@@ -297,6 +346,18 @@ def main():
                     iso_to_fuzzy(pg["end"]),
                 )
                 pushed += 1
+
+                # Épisode vu augmenté depuis Notion : entrée Calendrier (AVANT la mise à jour locale)
+                if int(pg["episode"] or 0) > int(entry["progress"] or 0):
+                    if calendar_log(
+                        pg["id"],
+                        pg["title"],
+                        int(pg["episode"]),
+                        datetime.now(timezone.utc).isoformat(),
+                        existing,
+                    ):
+                        logged += 1
+
                 # Mise à jour locale (pas de relecture complète de la liste)
                 entry["status"] = pg["status"]
                 entry["progress"] = int(pg["episode"] or 0)
@@ -304,6 +365,12 @@ def main():
                 entry["startedAt"] = iso_to_fuzzy(pg["start"])
                 entry["completedAt"] = iso_to_fuzzy(pg["end"])
                 time.sleep(0.7)
+
+            # Épisode vu augmenté depuis AniList : entrée Calendrier
+            if (entry["progress"] or 0) > (pg["episode"] or 0) and entry.get("updatedAt"):
+                when = datetime.fromtimestamp(entry["updatedAt"], timezone.utc).isoformat()
+                if calendar_log(pg["id"], pg["title"], int(entry["progress"]), when, existing):
+                    logged += 1
 
             # AniList -> Notion, seulement si nécessaire
             if needs_update(pg, entry):
@@ -314,7 +381,10 @@ def main():
             errors += 1
             print(f"  ! Erreur sur « {label} » : {ex}")
 
-    print(f"Créées : {created} | Mises à jour Notion : {updated} | Envoyées à AniList : {pushed} | Erreurs : {errors}")
+    print(
+        f"Créées : {created} | Mises à jour Notion : {updated} | "
+        f"Envoyées à AniList : {pushed} | Calendrier : {logged} | Erreurs : {errors}"
+    )
     if errors:
         sys.exit(1)
 
