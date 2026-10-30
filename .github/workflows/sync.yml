@@ -28,3 +28,4 @@ jobs:
           ANILIST_TOKEN: ${{ secrets.ANILIST_TOKEN }}
           ANILIST_USERNAME: ${{ secrets.ANILIST_USERNAME }}
           DEDUPE_ARCHIVE: ${{ vars.DEDUPE_ARCHIVE }}
+          CALENDAR_DB_ID: ${{ secrets.CALENDAR_DB_ID }}
