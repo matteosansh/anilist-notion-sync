@@ -35,7 +35,8 @@ def request_with_retry(method, url, **kwargs):
         if r.status_code >= 500:
             time.sleep(3)
             continue
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise requests.HTTPError(f"{r.status_code} sur {url} : {r.text[:500]}", response=r)
         return r
     raise RuntimeError(f"Trop de tentatives sur {url}")
 
@@ -105,7 +106,7 @@ def get_anilist_list(user_id):
 
 
 SAVE_MUTATION = """
-mutation ($mediaId: Int, $status: MediaListStatus, $score: Float,
+mutation ($mediaId: Int, $status: MediaListStatus, $score: Int,
           $progress: Int, $start: FuzzyDateInput, $end: FuzzyDateInput) {
   SaveMediaListEntry(mediaId: $mediaId, status: $status, scoreRaw: $score,
                      progress: $progress, startedAt: $start, completedAt: $end) {
@@ -121,7 +122,7 @@ def save_anilist(media_id, status, score, progress, start, end):
         {
             "mediaId": media_id,
             "status": status,
-            "score": float((score or 0) * 10),
+            "score": int(round((score or 0) * 10)),
             "progress": int(progress or 0),
             "start": start,
             "end": end,
