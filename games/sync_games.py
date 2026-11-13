@@ -1,4 +1,6 @@
 import os
+import sys
+import time
 import requests
 from notion_client import Client
 
@@ -39,23 +41,37 @@ def get_rawg_id(prop):
     return prop.get("number")
 
 
+def rawg_get(url, params):
+    """GET RAWG avec nouvelles tentatives (timeouts / erreurs 5xx / 429)."""
+    last = None
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 429 or r.status_code >= 500:
+                last = RuntimeError(f"RAWG {r.status_code}")
+            else:
+                return r
+        except requests.RequestException as ex:
+            last = ex
+        time.sleep(2 ** attempt * 2)
+    raise last
+
+
 def fetch_rawg_image(game_id=None, title=None):
     """Retourne l'URL de l'image RAWG (background_image) pour un jeu."""
     if game_id:
-        r = requests.get(
+        r = rawg_get(
             f"https://api.rawg.io/api/games/{int(game_id)}",
-            params={"key": RAWG_API_KEY},
-            timeout=15,
+            {"key": RAWG_API_KEY},
         )
         if r.ok:
             return r.json().get("background_image")
         return None
 
     if title:
-        r = requests.get(
+        r = rawg_get(
             "https://api.rawg.io/api/games",
-            params={"key": RAWG_API_KEY, "search": title, "page_size": 1},
-            timeout=15,
+            {"key": RAWG_API_KEY, "search": title, "page_size": 1},
         )
         if r.ok:
             results = r.json().get("results") or []
@@ -70,6 +86,10 @@ def sync_page(page):
     rawg_id = get_rawg_id(props.get(RAWG_ID_PROP))
     title = get_title(props.get(TITLE_PROP))
 
+    # Déjà rempli : on ne rappelle pas RAWG ni Notion
+    if (props.get(IMAGE_PROP) or {}).get("url") and page.get("cover"):
+        return False
+
     image_url = fetch_rawg_image(game_id=rawg_id, title=None if rawg_id else title)
     if not image_url:
         return False
@@ -83,12 +103,21 @@ def sync_page(page):
 
 
 def main():
-    total = updated = 0
+    total = updated = errors = 0
     for page in get_all_pages():
         total += 1
-        if sync_page(page):
-            updated += 1
-    print(f"Jeux : {total} | Images/couvertures mises à jour : {updated}")
+        try:
+            if sync_page(page):
+                updated += 1
+                time.sleep(0.35)
+        except Exception as ex:
+            errors += 1
+            title = get_title(page["properties"].get(TITLE_PROP))
+            print(f"  ! Erreur sur « {title} » : {ex}")
+    print(f"Jeux : {total} | Images/couvertures mises à jour : {updated} | Erreurs : {errors}")
+    # Échec du workflow seulement si tout a échoué (une panne RAWG ponctuelle n'est pas bloquante)
+    if total and errors == total:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
